@@ -263,29 +263,29 @@ async def process_speech(request: Request):
     import requests
 
     # Download and play the audio recording
-    if recording_url:
-        # Add .mp3 to get MP3 format (or .wav for WAV)
-        audio_response = requests.get(f"{recording_url}.mp3")
-        audio_data = audio_response.content
+    # if recording_url:
+    #     # Add .mp3 to get MP3 format (or .wav for WAV)
+    #     audio_response = requests.get(f"{recording_url}.mp3")
+    #     audio_data = audio_response.content
         
-        # Save temporarily and play the audio
+    #     # Save temporarily and play the audio
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-            temp_audio.write(audio_data)
-            temp_audio_path = temp_audio.name
-            print(f"Saved temporary audio to {temp_audio_path}")
+    #     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+    #         temp_audio.write(audio_data)
+    #         temp_audio_path = temp_audio.name
+    #         print(f"Saved temporary audio to {temp_audio_path}")
         
-        try:
-            # Play audio using system player (works on most systems)
-            if os.name == 'posix':  # Linux/Mac
-                subprocess.Popen(['mpg123', temp_audio_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # Or use: subprocess.Popen(['afplay', temp_audio_path])  # Mac only
-            elif os.name == 'nt':  # Windows
-                subprocess.Popen(['start', '', temp_audio_path], shell=True)
-        except Exception as e:
-            logger.error(f"Error playing audio: {str(e)}")
+    #     try:
+    #         # Play audio using system player (works on most systems)
+    #         if os.name == 'posix':  # Linux/Mac
+    #             subprocess.Popen(['mpg123', temp_audio_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    #             # Or use: subprocess.Popen(['afplay', temp_audio_path])  # Mac only
+    #         elif os.name == 'nt':  # Windows
+    #             subprocess.Popen(['start', '', temp_audio_path], shell=True)
+    #     except Exception as e:
+    #         logger.error(f"Error playing audio: {str(e)}")
         
-        # Now process the actual audio file for STT, saving, etc.
+    #     # Now process the actual audio file for STT, saving, etc.
     
     # Store conversation in session
     if call_sid in active_sessions:
