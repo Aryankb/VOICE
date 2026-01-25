@@ -745,11 +745,95 @@ async def generate_ai_response_sync(
     agent_prompt = agent_data.get("prompt", "You are a helpful AI assistant.")
     few_shot = agent_data.get("few_shot", [])
     data_to_fill = agent_data.get("data_to_fill", {})
+    agent_language = agent_data.get("language", "en-US")
 
     # Get conversation context
     conversation_history = session.get("conversation_history", [])
     past_conversations = session.get("past_conversations", [])
     data_collected = session.get("data_collected", {})
+
+    # USE OPENAI IF ENABLED
+    if settings.use_openai and settings.openai_api_key:
+        try:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+            # Build context from past conversations
+            context_summary = ""
+            if past_conversations:
+                context_summary = f"\n\nContext: Customer has called {len(past_conversations)} time(s) before."
+                if past_conversations[0].get("data_collected"):
+                    context_summary += f" We have their contact info: {past_conversations[0]['data_collected']}"
+
+            # Add data collection requirements
+            data_context = ""
+            if data_to_fill:
+                missing_fields = [name for name in data_to_fill.keys() if name not in data_collected]
+                if missing_fields:
+                    data_context = f"\n\nIMPORTANT: After helping the customer, collect: {', '.join(missing_fields)}"
+                    data_context += f"\nAlready collected: {list(data_collected.keys())}"
+
+            # Build messages for OpenAI
+            messages = [
+                {"role": "system", "content": f"{agent_prompt}{context_summary}{data_context}"}
+            ]
+
+            # Add few-shot examples
+            for example in few_shot:
+                messages.append({"role": "user", "content": example.get("user", "")})
+                messages.append({"role": "assistant", "content": example.get("assistant", "")})
+
+            # Add conversation history (last 10 messages for context)
+            for msg in conversation_history[-10:]:
+                messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", "")
+                })
+
+            # Add current user input
+            messages.append({"role": "user", "content": user_input})
+
+            # Call OpenAI
+            logger.info(f"Calling OpenAI {settings.openai_model} for {call_sid}")
+            response = await client.chat.completions.create(
+                model=settings.openai_model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=150  # Keep responses concise for phone calls
+            )
+
+            ai_response = response.choices[0].message.content
+            logger.info(f"OpenAI response for {call_sid}: {ai_response[:100]}...")
+
+            # Check if response contains data - try to extract it
+            if data_to_fill:
+                for field_name in data_to_fill.keys():
+                    if field_name not in data_collected:
+                        # Simple extraction - look for the field name in user input
+                        if field_name.lower() in user_input.lower():
+                            # Use OpenAI to extract the value
+                            extraction_messages = [
+                                {"role": "system", "content": f"Extract only the {field_name} from the user's message. Return ONLY the value, nothing else. If not found, return 'NOT_FOUND'."},
+                                {"role": "user", "content": user_input}
+                            ]
+                            extraction_response = await client.chat.completions.create(
+                                model="gpt-3.5-turbo",  # Use cheaper model for extraction
+                                messages=extraction_messages,
+                                temperature=0,
+                                max_tokens=50
+                            )
+                            extracted_value = extraction_response.choices[0].message.content.strip()
+
+                            if extracted_value != "NOT_FOUND" and len(extracted_value) > 0:
+                                data_collected[field_name] = extracted_value
+                                session["data_collected"] = data_collected
+                                logger.info(f"Extracted {field_name}: {extracted_value}")
+
+            return ai_response
+
+        except Exception as e:
+            logger.error(f"OpenAI error: {e}. Falling back to placeholder responses.")
+            # Fall through to placeholder logic below
 
     # TODO: Integrate with LLM (OpenAI, Claude, etc.)
     # Pass full context to LLM:

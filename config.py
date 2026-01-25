@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     enable_dynamodb: bool = True  # Enable/disable DynamoDB integration
     enable_s3_upload: bool = True  # Enable/disable S3 recording upload
 
+    # LLM Configuration
+    openai_api_key: Optional[str] = None  # OpenAI API key for GPT-4
+    use_openai: bool = False  # Enable OpenAI integration
+    openai_model: str = "gpt-4"  # Model to use (gpt-4, gpt-3.5-turbo, etc.)
+
     class Config:
         env_file = ".env"
         case_sensitive = False
