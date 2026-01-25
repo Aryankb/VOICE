@@ -3,7 +3,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException
 from fastapi.responses import HTMLResponse
 from twilio.rest import Client
@@ -148,40 +148,100 @@ async def get_session(call_sid: str):
 
 @app.post("/voice/outbound")
 async def outbound_call_twiml(request: Request):
-    """TwiML for outbound calls - initial greeting"""
+    """TwiML for outbound calls - initial greeting with agent data loading"""
     form_data = await request.form()
     call_sid = form_data.get("CallSid")
-    
-    logger.info(f"Outbound call answered: {call_sid}")
-    
+
+    # Get agent_id from query params
+    agent_id = request.query_params.get("agent_id")
+
+    logger.info(f"Outbound call answered: {call_sid}, agent: {agent_id}")
+
     response = VoiceResponse()
-    
+
+    # Default values (fallback if DynamoDB disabled or agent not found)
+    greeting = "Hello! I'm your AI assistant. What is your preference language?"
+    voice = "Polly.Joanna"
+    language = "en-US"
+    gather_language = "hi-IN"
+
+    try:
+        # FETCH ONCE - Load agent data and past conversations if DynamoDB enabled
+        if settings.enable_dynamodb and agent_id:
+            from agent_manager import get_agent
+            from call_manager import fetch_past_conversations, create_call_record
+
+            # Fetch agent configuration
+            agent_data = await get_agent(agent_id)
+
+            # Get recipient phone from session or form data
+            recipient_phone = form_data.get("To") or active_sessions.get(call_sid, {}).get("to")
+
+            # Fetch past conversations for this agent-recipient pair
+            past_conversations = await fetch_past_conversations(
+                agent_id=agent_id,
+                recipient_phone=recipient_phone,
+                limit=5
+            )
+
+            # Create initial call record in database
+            await create_call_record(
+                call_sid=call_sid,
+                agent_id=agent_id,
+                recipient_phone=recipient_phone,
+                caller_phone=form_data.get("From") or settings.twilio_phone_number,
+                status="in-progress"
+            )
+
+            # UPDATE SESSION with all fetched data
+            if call_sid in active_sessions:
+                active_sessions[call_sid].update({
+                    "agent_id": agent_id,
+                    "agent_data": agent_data.model_dump(),  # Store as dict for JSON serialization
+                    "past_conversations": [pc.model_dump() for pc in past_conversations],
+                    "data_collected": {},
+                    "message_count": 0,
+                    "last_sync_count": 0,
+                    "no_input_count": 0
+                })
+
+                # Use agent's configuration for greeting
+                greeting = agent_data.greeting
+                voice = agent_data.voice
+                language = agent_data.language
+                gather_language = agent_data.language
+
+                logger.info(
+                    f"Loaded agent data for {call_sid}: {agent_data.name}, "
+                    f"past_conversations={len(past_conversations)}"
+                )
+
+    except Exception as e:
+        logger.error(f"Error loading agent data for {call_sid}: {e}")
+        # Continue with defaults (graceful degradation)
+
     # Initial greeting
-    response.say(
-        "Hello! I'm your AI assistant. What is your preference language?",
-        voice="Polly.Joanna",
-        language="en-US"
-    )
-    
+    response.say(greeting, voice=voice, language=language)
+
     # Use Gather to capture speech input
     gather = response.gather(
         input="speech",
         action=f"{settings.public_url}/voice/process-speech",
         method="POST",
         speech_timeout=3,  # Wait 3 seconds of silence before processing
-        language="hi-IN",
+        language=gather_language,
         hints="help, information, question, support",
         speech_model="experimental_conversations",  # Better conversation model
         enhanced=True  # Enhanced speech recognition
     )
-    
+
     # If no input is received
     response.say(
         "I didn't hear anything. Please try again or hang up.",
-        voice="Polly.Joanna"
+        voice=voice
     )
-    response.redirect(f"{settings.public_url}/voice/outbound")
-    
+    response.redirect(f"{settings.public_url}/voice/outbound?agent_id={agent_id}")
+
     return Response(content=str(response), media_type="application/xml")
 
 
@@ -189,56 +249,76 @@ async def outbound_call_twiml(request: Request):
 async def make_call(request: Request):
     """
     Initiate an outbound call
-    
+
     Request body:
+        agent_id: Agent identifier (REQUIRED)
         to_number: Phone number to call (E.164 format, e.g., +1234567890)
         from_number: Optional Twilio number to call from (defaults to configured number)
-        initial_message: Optional custom greeting message
+        initial_message: Optional custom greeting message (overrides agent greeting)
     """
     try:
         body = await request.json()
+        agent_id = body.get("agent_id")
         to_number = body.get("to_number")
         from_number = body.get("from_number") or settings.twilio_phone_number
         initial_message = body.get("initial_message")
-        
+
+        # Validate required fields
+        if not agent_id:
+            raise HTTPException(status_code=400, detail="agent_id is required")
         if not to_number:
             raise HTTPException(status_code=400, detail="to_number is required")
-        
+
+        # Validate agent exists (only if DynamoDB is enabled)
+        if settings.enable_dynamodb:
+            from agent_manager import get_agent
+            try:
+                agent = await get_agent(agent_id)
+                logger.info(f"Validated agent {agent_id}: {agent.name}")
+            except Exception as e:
+                logger.error(f"Agent validation failed: {e}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Agent {agent_id} not found or invalid"
+                )
+
         # Store initial message in session if provided
         session_data = {}
         if initial_message:
             session_data["initial_message"] = initial_message
-            
-        # Create call with TwiML URL
+
+        # Create call with TwiML URL (pass agent_id as query param)
         call = twilio_client.calls.create(
             to=to_number,
             from_=from_number,
-            url=f"{settings.public_url}/voice/outbound",
+            url=f"{settings.public_url}/voice/outbound?agent_id={agent_id}",
             status_callback=f"{settings.public_url}/call-status",
             status_callback_event=["initiated", "ringing", "answered", "completed"],
             machine_detection="DetectMessageEnd",  # Detect answering machines
             record=True
         )
-        
-        # Store session data
+
+        # Store minimal session data (full data loaded in /voice/outbound)
         active_sessions[call.sid] = {
+            "agent_id": agent_id,
             "to": to_number,
             "from": from_number,
             "conversation_history": [],
             "started_at": datetime.now().isoformat(),
             **session_data
         }
-        
-        logger.info(f"Call initiated: {call.sid} to {to_number}")
-        
+
+        logger.info(f"Call initiated: {call.sid} to {to_number} with agent {agent_id}")
+
         return {
             "success": True,
             "call_sid": call.sid,
             "status": call.status,
             "to": to_number,
-            "from": from_number
+            "from": from_number,
+            "agent_id": agent_id
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -248,94 +328,140 @@ async def make_call(request: Request):
 
 @app.post("/voice/process-speech")
 async def process_speech(request: Request):
-    """Process speech input from caller"""
+    """Process speech input from caller with conversation management"""
     form_data = await request.form()
     call_sid = form_data.get("CallSid")
     speech_result = form_data.get("SpeechResult", "")
     confidence = form_data.get("Confidence", "0.0")
     recording_url = form_data.get("RecordingUrl", "")  # Audio file URL
     recording_sid = form_data.get("RecordingSid", "")  # Recording ID
-    
-    logger.info(f"Speech from {call_sid}: '{speech_result}' (confidence: {confidence})")
-    logger.info(f"Recording URL: {recording_url}, SID: {recording_sid}")
-    
-    response = VoiceResponse()
-    import requests
 
-    # Download and play the audio recording
-    # if recording_url:
-    #     # Add .mp3 to get MP3 format (or .wav for WAV)
-    #     audio_response = requests.get(f"{recording_url}.mp3")
-    #     audio_data = audio_response.content
-        
-    #     # Save temporarily and play the audio
-        
-    #     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
-    #         temp_audio.write(audio_data)
-    #         temp_audio_path = temp_audio.name
-    #         print(f"Saved temporary audio to {temp_audio_path}")
-        
-    #     try:
-    #         # Play audio using system player (works on most systems)
-    #         if os.name == 'posix':  # Linux/Mac
-    #             subprocess.Popen(['mpg123', temp_audio_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    #             # Or use: subprocess.Popen(['afplay', temp_audio_path])  # Mac only
-    #         elif os.name == 'nt':  # Windows
-    #             subprocess.Popen(['start', '', temp_audio_path], shell=True)
-    #     except Exception as e:
-    #         logger.error(f"Error playing audio: {str(e)}")
-        
-    #     # Now process the actual audio file for STT, saving, etc.
-    
-    # Store conversation in session
-    if call_sid in active_sessions:
-        active_sessions[call_sid]["conversation_history"].append({
-            "role": "user",
-            "content": speech_result,
-            "timestamp": datetime.now().isoformat(),
-            "confidence": float(confidence),
-            "recording_url": recording_url,
-            "recording_sid": recording_sid
-        })
-    
+    logger.info(f"Speech from {call_sid}: '{speech_result}' (confidence: {confidence})")
+
+    response = VoiceResponse()
+
+    # ACCESS SESSION (no DB fetch - data already loaded in /voice/outbound)
+    if call_sid not in active_sessions:
+        logger.error(f"Session not found for {call_sid}")
+        response.say("I'm sorry, session expired. Goodbye.", voice="Polly.Joanna")
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
+
+    session = active_sessions[call_sid]
+
+    # Get agent data from session (already loaded)
+    agent_data = session.get("agent_data", {})
+    voice = agent_data.get("voice", "Polly.Joanna")
+    language = agent_data.get("language", "en-US")
+
+    # Handle empty input
+    if not speech_result:
+        session["no_input_count"] = session.get("no_input_count", 0) + 1
+
+        # SYSTEM TIMEOUT: Hangup after 3 failed inputs
+        if session["no_input_count"] >= 3:
+            logger.info(f"System timeout for {call_sid}: 3 failed inputs")
+            response.say("I didn't receive any input. Goodbye.", voice=voice)
+            response.hangup()
+            session["ended_by"] = "system_timeout"
+            return Response(content=str(response), media_type="application/xml")
+
+        response.say("I didn't hear anything. Please speak again.", voice=voice)
+        response.redirect(f"{settings.public_url}/voice/process-speech")
+        return Response(content=str(response), media_type="application/xml")
+
+    # Reset no_input_count on successful input
+    session["no_input_count"] = 0
+
+    # DETECT GOODBYE INTENT
+    from session_manager import detect_goodbye_intent, is_data_collection_complete
+
+    if detect_goodbye_intent(speech_result):
+        logger.info(f"Goodbye intent detected for {call_sid}")
+        response.say("Thank you for calling. Have a great day! Goodbye.", voice=voice)
+        response.hangup()
+        session["ended_by"] = "user"
+
+        # Sync final state to DB
+        if settings.enable_dynamodb:
+            from session_manager import sync_session_to_db
+            await sync_session_to_db(call_sid, active_sessions, force=True)
+
+        return Response(content=str(response), media_type="application/xml")
+
+    # APPEND USER MESSAGE to conversation history
+    from decimal import Decimal
+    user_message = {
+        "role": "user",
+        "content": speech_result,
+        "timestamp": datetime.now().isoformat(),
+        "confidence": float(confidence),  # Keep as float in memory
+        "recording_url": recording_url,
+        "recording_sid": recording_sid
+    }
+    session["conversation_history"].append(user_message)
+    session["message_count"] = session.get("message_count", 0) + 1
+
     # Generate AI response
     try:
-        ai_response = await generate_ai_response_sync(speech_result, call_sid)
-        
-        # Store AI response in conversation history
-        if call_sid in active_sessions:
-            active_sessions[call_sid]["conversation_history"].append({
-                "role": "assistant",
-                "content": ai_response,
-                "timestamp": datetime.now().isoformat()
-            })
-        
-        # Speak the response
-        response.say(
-            ai_response,
-            voice="Polly.Aditi",
-            # language="hi-IN"
+        ai_response = await generate_ai_response_sync(
+            user_input=speech_result,
+            call_sid=call_sid,
+            session=session
         )
-        
+
+        # APPEND AI RESPONSE to conversation history
+        assistant_message = {
+            "role": "assistant",
+            "content": ai_response,
+            "timestamp": datetime.now().isoformat()
+        }
+        session["conversation_history"].append(assistant_message)
+        session["message_count"] = session.get("message_count", 0) + 1
+
+        # PERIODIC SYNC to DynamoDB every N messages
+        if settings.enable_dynamodb:
+            from session_manager import sync_session_to_db
+
+            if session["message_count"] % settings.session_sync_frequency == 0:
+                logger.info(f"Periodic sync triggered for {call_sid} at {session['message_count']} messages")
+                await sync_session_to_db(call_sid, active_sessions)
+
+        # CHECK DATA COLLECTION COMPLETION
+        if is_data_collection_complete(session):
+            logger.info(f"Data collection complete for {call_sid}")
+            response.say(
+                "Thank you! I have all the information I need. Have a great day!",
+                voice=voice
+            )
+            response.hangup()
+            session["ended_by"] = "system_complete"
+
+            # Final sync
+            if settings.enable_dynamodb:
+                await sync_session_to_db(call_sid, active_sessions, force=True)
+
+            return Response(content=str(response), media_type="application/xml")
+
+        # Speak the response
+        response.say(ai_response, voice=voice)
+
         # Wait for more input
         gather = response.gather(
             input="speech",
             action=f"{settings.public_url}/voice/process-speech",
             method="POST",
-            speech_timeout=3,  # Wait 3 seconds of silence
-            language="hi-IN",
+            speech_timeout=3,
+            language=language,
             hints="help, information, question, support, goodbye, thanks",
             speech_model="experimental_conversations",
             enhanced=True
         )
-        
+
         # If no more input
-        response.say(
-            "Is there anything else I can help you with?",
-            voice="Polly.Aditi"
-        )
+        response.say("Is there anything else I can help you with?", voice=voice)
         response.redirect(f"{settings.public_url}/voice/process-speech")
-        
+
     except Exception as e:
         logger.error(f"Error processing speech: {str(e)}", exc_info=True)
         response.say(
@@ -343,34 +469,109 @@ async def process_speech(request: Request):
             voice="Polly.Joanna"
         )
         response.hangup()
-    
+        session["ended_by"] = "error"
+
     return Response(content=str(response), media_type="application/xml")
 
 
 @app.post("/call-status")
 async def call_status(request: Request):
-    """Webhook for call status updates"""
+    """Webhook for call status updates with finalization and S3 upload"""
     form_data = await request.form()
     call_sid = form_data.get("CallSid")
     call_status = form_data.get("CallStatus")
     answered_by = form_data.get("AnsweredBy")  # human or machine
-    
+    recording_url = form_data.get("RecordingUrl")
+    recording_sid = form_data.get("RecordingSid")
+    call_duration = form_data.get("CallDuration")
+
     logger.info(f"Call {call_sid} status: {call_status}, answered_by: {answered_by}")
-    
+
     # Handle answering machine detection
     if answered_by == "machine_start":
         logger.info(f"Call {call_sid} answered by machine")
-        # You can leave a voicemail or handle differently
-    
-    # Clean up session when call ends
+
+    # Finalize call when it ends
     if call_status in ["completed", "failed", "busy", "no-answer", "canceled"]:
         if call_sid in active_sessions:
-            # Log conversation history before cleanup
             session = active_sessions[call_sid]
-            logger.info(f"Call {call_sid} conversation: {len(session.get('conversation_history', []))} messages")
+
+            # Calculate duration
+            duration_seconds = None
+            if call_duration:
+                try:
+                    duration_seconds = int(call_duration)
+                except ValueError:
+                    pass
+
+            if not duration_seconds and session.get("started_at"):
+                try:
+                    started_at = datetime.fromisoformat(session["started_at"])
+                    duration_seconds = int((datetime.now() - started_at).total_seconds())
+                except Exception:
+                    pass
+
+            # Download recording to S3 if enabled
+            s3_url = None
+            if settings.enable_dynamodb and settings.enable_s3_upload and recording_url:
+                try:
+                    from s3_uploader import s3_uploader
+                    logger.info(f"Uploading recording to S3 for {call_sid}")
+                    s3_url = await s3_uploader.download_and_upload_recording(
+                        recording_url=recording_url,
+                        call_sid=call_sid
+                    )
+                    if s3_url:
+                        logger.info(f"Recording uploaded to S3: {s3_url}")
+                except Exception as e:
+                    logger.error(f"Failed to upload recording to S3: {e}")
+
+            # Finalize call in database
+            if settings.enable_dynamodb:
+                try:
+                    from call_manager import finalize_call
+                    from models import ConversationMessage
+
+                    # Convert conversation_history to ConversationMessage objects
+                    conversation_history = [
+                        ConversationMessage(**msg) if isinstance(msg, dict) else msg
+                        for msg in session.get("conversation_history", [])
+                    ]
+
+                    await finalize_call(
+                        call_sid=call_sid,
+                        status=call_status,
+                        ended_at=datetime.now().isoformat(),
+                        duration_seconds=duration_seconds,
+                        ended_by=session.get("ended_by", "unknown"),
+                        conversation_history=conversation_history,
+                        call_recording_url=recording_url,
+                        call_recording_sid=recording_sid,
+                        s3_recording_url=s3_url,
+                        data_collected=session.get("data_collected", {}),
+                        answered_by=answered_by
+                    )
+
+                    logger.info(
+                        f"Finalized call {call_sid} in DB: "
+                        f"status={call_status}, duration={duration_seconds}s, "
+                        f"messages={len(conversation_history)}"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Failed to finalize call {call_sid} in DB: {e}")
+
+            # Log conversation history before cleanup
+            logger.info(
+                f"Call {call_sid} completed: "
+                f"{len(session.get('conversation_history', []))} messages, "
+                f"ended_by={session.get('ended_by', 'unknown')}"
+            )
+
+            # Cleanup session from memory
             del active_sessions[call_sid]
             logger.info(f"Cleaned up session for call {call_sid}")
-    
+
     return {"status": "ok"}
 
 
@@ -519,47 +720,109 @@ async def call_status(request: Request):
 #     return "Thank you for your message. I'm processing your request."
 
 
-async def generate_ai_response_sync(user_input: str, call_sid: str) -> str:
+async def generate_ai_response_sync(
+    user_input: str,
+    call_sid: str,
+    session: Optional[Dict[str, Any]] = None
+) -> str:
     """
-    Generate AI response based on user input with conversation context
-    
+    Generate AI response based on user input with full context
+
     Args:
         user_input: The user's speech input
-        call_sid: Call SID to retrieve conversation history
-    
+        call_sid: Call SID for logging
+        session: Session dict with agent_data, conversation_history, past_conversations
+
     Returns:
         AI-generated response text
     """
-    # Get conversation history
-    conversation_history = []
-    if call_sid in active_sessions:
-        conversation_history = active_sessions[call_sid].get("conversation_history", [])
-    
-    # Check for goodbye/exit intents
-    goodbye_phrases = ["goodbye", "bye", "thank you", "thanks", "that's all", "nothing else"]
-    if any(phrase in user_input.lower() for phrase in goodbye_phrases):
-        return "Thank you for calling. Have a great day! Goodbye."
-    
+    # Get session data
+    if session is None:
+        session = active_sessions.get(call_sid, {})
+
+    # Get agent configuration
+    agent_data = session.get("agent_data", {})
+    agent_prompt = agent_data.get("prompt", "You are a helpful AI assistant.")
+    few_shot = agent_data.get("few_shot", [])
+    data_to_fill = agent_data.get("data_to_fill", {})
+
+    # Get conversation context
+    conversation_history = session.get("conversation_history", [])
+    past_conversations = session.get("past_conversations", [])
+    data_collected = session.get("data_collected", {})
+
     # TODO: Integrate with LLM (OpenAI, Claude, etc.)
+    # Pass full context to LLM:
+    # - agent_prompt: System prompt
+    # - few_shot: Few-shot examples
+    # - past_conversations: Previous calls with this user
+    # - conversation_history: Current conversation
+    # - data_to_fill: Data collection requirements
+    # - data_collected: Data collected so far
+
     # For now, return contextual responses based on input
-    
     user_lower = user_input.lower()
-    
+
+    # Check if we need to collect specific data
+    for field_name, field_config in data_to_fill.items():
+        if field_name not in data_collected:
+            # Try to extract data from user input
+            # TODO: Use LLM to extract structured data
+            # For now, simple keyword matching
+            if field_name.lower() in user_lower:
+                data_collected[field_name] = user_input
+                session["data_collected"] = data_collected
+                logger.info(f"Collected data for {field_name}: {user_input}")
+
+                # Ask for next required field
+                next_field = next(
+                    (name for name, cfg in data_to_fill.items() if name not in data_collected),
+                    None
+                )
+                if next_field:
+                    next_prompt = data_to_fill[next_field].get("prompt", f"Please provide your {next_field}")
+                    return next_prompt
+                else:
+                    return "Thank you! I have all the information I need."
+
+    # Get agent's language for responses
+    agent_language = agent_data.get("language", "en-US")
+    is_hindi = "hi" in agent_language.lower()
+
+    # Default responses (placeholder until LLM integration)
     if "help" in user_lower:
-        return "मैं आपकी जानकारी, सवालों के जवाब या आपकी ज़रूरतों में मदद कर सकता हूँ। आप क्या जानना चाहेंगे?"
+        if is_hindi:
+            return "मैं आपकी जानकारी, सवालों के जवाब या आपकी ज़रूरतों में मदद कर सकता हूँ। आप क्या जानना चाहेंगे?"
+        else:
+            return "I can help you with information, answer questions, or assist with your needs. What would you like to know?"
     elif "weather" in user_lower:
-        return "मैं एक AI सहायक हूँ। मौसम की जानकारी के लिए, कृपया मौसम की वेबसाइट देखें या मौसम सेवा से पूछें।"
+        if is_hindi:
+            return "मैं एक AI सहायक हूँ। मौसम की जानकारी के लिए, कृपया मौसम की वेबसाइट देखें या मौसम सेवा से पूछें।"
+        else:
+            return "I'm an AI assistant. For weather information, please check a weather website or service."
     elif "time" in user_lower:
         now = datetime.now()
-        return f"वर्तमान समय {now.strftime('%I:%M %p')} है।"
+        if is_hindi:
+            return f"वर्तमान समय {now.strftime('%I:%M %p')} है।"
+        else:
+            return f"The current time is {now.strftime('%I:%M %p')}."
     elif "date" in user_lower:
         now = datetime.now()
-        return f"आज {now.strftime('%A, %B %d, %Y')} है।"
+        if is_hindi:
+            return f"आज {now.strftime('%A, %B %d, %Y')} है।"
+        else:
+            return f"Today is {now.strftime('%A, %B %d, %Y')}."
     elif any(word in user_lower for word in ["hello", "hi", "hey"]):
-        return "नमस्ते! मैं आज आपकी कैसे मदद कर सकता हूँ?"
+        if is_hindi:
+            return "नमस्ते! मैं आज आपकी कैसे मदद कर सकता हूँ?"
+        else:
+            return "Hello! How can I help you today?"
     else:
-        # Generic response
-        return f"मैंने सुना कि आपने कहा: {user_input}। मैं मदद के लिए यहाँ हूँ। क्या आप कृपया अधिक विवरण दे सकते हैं या कोई विशेष प्रश्न पूछ सकते हैं?"
+        # Generic response with context awareness
+        if is_hindi:
+            return f"मैंने सुना कि आपने कहा: {user_input}। मैं मदद के लिए यहाँ हूँ। क्या आप कृपया अधिक विवरण दे सकते हैं?"
+        else:
+            return f"I heard you say: {user_input}. I'm here to help. Could you please provide more details or ask a specific question?"
 
 
 async def generate_tts(text: str) -> str:

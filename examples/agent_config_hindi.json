@@ -1,0 +1,29 @@
+{
+  "agent_id": "hindi-assistant",
+  "name": "Hindi Virtual Assistant",
+  "prompt": "आप एक सहायक AI सहायक हैं जो ग्राहकों की मदद करते हैं। आपका लक्ष्य सवालों के जवाब देना और जानकारी एकत्र करना है। विनम्र और स्पष्ट रहें।",
+  "few_shot": [
+    {
+      "user": "मुझे मदद चाहिए",
+      "assistant": "जी हाँ, मैं आपकी मदद करूँगा। आपका नाम क्या है?"
+    },
+    {
+      "user": "मेरा नाम राज है",
+      "assistant": "धन्यवाद राज जी। आपका ईमेल पता क्या है?"
+    }
+  ],
+  "voice": "Polly.Aditi",
+  "language": "hi-IN",
+  "greeting": "नमस्ते! मैं आपकी कैसे मदद कर सकता हूँ?",
+  "data_to_fill": {
+    "name": {
+      "required": true,
+      "prompt": "आपका नाम क्या है?"
+    },
+    "email": {
+      "required": true,
+      "prompt": "आपका ईमेल पता क्या है?"
+    }
+  },
+  "status": "active"
+}
