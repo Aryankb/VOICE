@@ -44,6 +44,19 @@ class Settings(BaseSettings):
     use_openai: bool = False  # Enable OpenAI integration
     openai_model: str = "gpt-4"  # Model to use (gpt-4, gpt-3.5-turbo, etc.)
 
+    # Local LLM Configuration (Ollama)
+    use_local_llm: bool = True  # Enable local LLM (Ollama)
+    ollama_host: str = "http://localhost:11434"  # Ollama API endpoint
+    ollama_model: str = "qwen2.5-coder:32b-instruct-q4_K_M"  # Model name
+    ollama_timeout: int = 120  # Timeout in seconds for LLM responses
+
+    # Local TTS Configuration
+    use_local_tts: bool = True  # Enable local TTS
+    tts_engine: str = "xtts"  # Options: xtts, melo
+    tts_output_dir: str = "./tts_output"  # Directory for generated audio files
+    tts_sample_rate: int = 8000  # Twilio requires 8kHz for mulaw
+    tts_cleanup_delay: int = 300  # Delete audio files after N seconds
+
     class Config:
         env_file = ".env"
         case_sensitive = False

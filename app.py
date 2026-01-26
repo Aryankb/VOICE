@@ -5,7 +5,8 @@ import logging
 from datetime import datetime
 from typing import Dict, Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Start, Stream, Dial, Say
 from config import settings
@@ -24,6 +25,59 @@ twilio_client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
 
 # Store active call sessions
 active_sessions: Dict[str, dict] = {}
+
+# Create TTS output directory if it doesn't exist
+import pathlib
+tts_output_path = pathlib.Path(settings.tts_output_dir)
+tts_output_path.mkdir(parents=True, exist_ok=True)
+
+
+async def add_voice_response(
+    response: VoiceResponse,
+    text: str,
+    voice: str = "Polly.Joanna",
+    language: str = "en-US"
+) -> VoiceResponse:
+    """
+    Add voice response to TwiML - uses local TTS if enabled, otherwise Twilio TTS
+
+    Args:
+        response: TwiML VoiceResponse object
+        text: Text to speak
+        voice: Twilio voice name (used only if local TTS disabled)
+        language: Language code
+
+    Returns:
+        Updated VoiceResponse object
+    """
+    if settings.use_local_tts:
+        try:
+            from local_tts_client import get_tts_client
+            tts_client = get_tts_client()
+
+            # Generate audio file
+            audio_file = await tts_client.generate_speech(text, language, voice)
+
+            # Get filename from path
+            filename = pathlib.Path(audio_file).name
+
+            # Use public URL to serve the file
+            audio_url = f"{settings.public_url}/tts/{filename}"
+
+            logger.info(f"Using local TTS: {audio_url}")
+
+            # Play the generated audio
+            response.play(audio_url)
+
+        except Exception as e:
+            logger.error(f"Local TTS failed: {e}. Falling back to Twilio TTS.")
+            # Fallback to Twilio TTS
+            response.say(text, voice=voice, language=language)
+    else:
+        # Use Twilio's built-in TTS
+        response.say(text, voice=voice, language=language)
+
+    return response
 
 
 # class AudioBuffer:
@@ -89,8 +143,57 @@ async def root():
         "status": "ok",
         "message": "Twilio Voice AI Assistant is running",
         "active_sessions": len(active_sessions),
-        "public_url": settings.public_url
+        "public_url": settings.public_url,
+        "local_llm_enabled": settings.use_local_llm,
+        "local_tts_enabled": settings.use_local_tts
     }
+
+
+@app.get("/health/local")
+async def health_check_local():
+    """Health check for local LLM and TTS"""
+    status = {
+        "llm": {"enabled": settings.use_local_llm, "healthy": False, "error": None},
+        "tts": {"enabled": settings.use_local_tts, "healthy": False, "error": None}
+    }
+
+    # Check LLM
+    if settings.use_local_llm:
+        try:
+            from local_llm_client import get_llm_client
+            llm_client = get_llm_client()
+            status["llm"]["healthy"] = await llm_client.health_check()
+            status["llm"]["model"] = settings.ollama_model
+        except Exception as e:
+            status["llm"]["error"] = str(e)
+
+    # Check TTS
+    if settings.use_local_tts:
+        try:
+            from local_tts_client import get_tts_client
+            tts_client = get_tts_client()
+            status["tts"]["healthy"] = await tts_client.health_check()
+            status["tts"]["engine"] = settings.tts_engine
+        except Exception as e:
+            status["tts"]["error"] = str(e)
+
+    return status
+
+
+@app.get("/tts/{filename}")
+async def serve_tts_file(filename: str):
+    """Serve generated TTS audio files"""
+    file_path = tts_output_path / filename
+
+    # Security: Only serve files from TTS output directory
+    if not file_path.exists() or not str(file_path).startswith(str(tts_output_path)):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        file_path,
+        media_type="audio/wav",
+        headers={"Content-Disposition": f"inline; filename={filename}"}
+    )
 
 
 @app.get("/sessions")
@@ -358,15 +461,41 @@ async def process_speech(request: Request):
     if not speech_result:
         session["no_input_count"] = session.get("no_input_count", 0) + 1
 
-        # SYSTEM TIMEOUT: Hangup after 3 failed inputs
+        # Check if we have all required data
+        data_to_fill = agent_data.get("data_to_fill", {})
+        data_collected = session.get("data_collected", {})
+        all_data_collected = all(field in data_collected for field in data_to_fill.keys())
+
+        # SMART TIMEOUT: Check if we have all data before ending
         if session["no_input_count"] >= 3:
-            logger.info(f"System timeout for {call_sid}: 3 failed inputs")
-            response.say("I didn't receive any input. Goodbye.", voice=voice)
+            logger.info(f"System timeout for {call_sid}: 3 failed inputs, data_complete={all_data_collected}")
+
+            if all_data_collected:
+                # We have all the data, offer graceful exit
+                response.say(
+                    "I'm having trouble hearing you. We have all the information we need. "
+                    "If there's anything else I can help with, please let me know. Otherwise, have a great day! Goodbye.",
+                    voice=voice
+                )
+            else:
+                # Missing data, but can't hear user - be helpful
+                response.say(
+                    "I'm having trouble hearing you clearly. "
+                    "If you need assistance, please try calling back when you're in a quieter location. "
+                    "Goodbye for now.",
+                    voice=voice
+                )
+
             response.hangup()
             session["ended_by"] = "system_timeout"
             return Response(content=str(response), media_type="application/xml")
 
-        response.say("I didn't hear anything. Please speak again.", voice=voice)
+        # First or second failed attempt - encourage user
+        if session["no_input_count"] == 1:
+            response.say("I didn't hear anything. Please speak a bit louder.", voice=voice)
+        else:
+            response.say("I'm still having trouble hearing you. Could you speak more clearly?", voice=voice)
+
         response.redirect(f"{settings.public_url}/voice/process-speech")
         return Response(content=str(response), media_type="application/xml")
 
@@ -428,20 +557,12 @@ async def process_speech(request: Request):
                 await sync_session_to_db(call_sid, active_sessions)
 
         # CHECK DATA COLLECTION COMPLETION
+        # Don't auto-hangup - let conversation flow naturally
+        # Just track that data is complete for graceful exit options
         if is_data_collection_complete(session):
-            logger.info(f"Data collection complete for {call_sid}")
-            response.say(
-                "Thank you! I have all the information I need. Have a great day!",
-                voice=voice
-            )
-            response.hangup()
-            session["ended_by"] = "system_complete"
-
-            # Final sync
-            if settings.enable_dynamodb:
-                await sync_session_to_db(call_sid, active_sessions, force=True)
-
-            return Response(content=str(response), media_type="application/xml")
+            if not session.get("data_complete_announced"):
+                logger.info(f"Data collection complete for {call_sid} - marking for graceful exit")
+                session["data_complete_announced"] = True
 
         # Speak the response
         response.say(ai_response, voice=voice)
@@ -832,9 +953,81 @@ async def generate_ai_response_sync(
             return ai_response
 
         except Exception as e:
-            logger.error(f"OpenAI error: {e}. Falling back to placeholder responses.")
+            logger.error(f"OpenAI error: {e}. Falling back to local LLM.")
+            # Fall through to local LLM logic below
+
+    # USE LOCAL LLM IF ENABLED
+    if settings.use_local_llm:
+        try:
+            from local_llm_client import get_llm_client
+            llm_client = get_llm_client()
+
+            # Build context from past conversations
+            context_summary = ""
+            if past_conversations:
+                context_summary = f"\n\nContext: Customer has called {len(past_conversations)} time(s) before."
+                if past_conversations[0].get("data_collected"):
+                    context_summary += f" We have their contact info: {past_conversations[0]['data_collected']}"
+
+            # Add data collection requirements
+            data_context = ""
+            if data_to_fill:
+                missing_fields = [name for name in data_to_fill.keys() if name not in data_collected]
+                if missing_fields:
+                    data_context = f"\n\nIMPORTANT: After helping the customer, collect: {', '.join(missing_fields)}"
+                    data_context += f"\nAlready collected: {list(data_collected.keys())}"
+
+            # Build messages for local LLM (same format as OpenAI)
+            messages = [
+                {"role": "system", "content": f"{agent_prompt}{context_summary}{data_context}"}
+            ]
+
+            # Add few-shot examples
+            for example in few_shot:
+                messages.append({"role": "user", "content": example.get("user", "")})
+                messages.append({"role": "assistant", "content": example.get("assistant", "")})
+
+            # Add conversation history (last 10 messages for context)
+            for msg in conversation_history[-10:]:
+                messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", "")
+                })
+
+            # Add current user input
+            messages.append({"role": "user", "content": user_input})
+
+            # Call local LLM
+            logger.info(f"Calling local LLM {settings.ollama_model} for {call_sid}")
+            ai_response = await llm_client.chat(
+                messages=messages,
+                temperature=0.7,
+                max_tokens=150  # Keep responses concise for phone calls
+            )
+
+            logger.info(f"Local LLM response for {call_sid}: {ai_response[:100]}...")
+
+            # Check if response contains data - try to extract it
+            if data_to_fill:
+                for field_name in data_to_fill.keys():
+                    if field_name not in data_collected:
+                        # Simple extraction - look for the field name in user input
+                        if field_name.lower() in user_input.lower():
+                            # Use local LLM to extract the value
+                            extracted_value = await llm_client.extract_field(user_input, field_name)
+
+                            if extracted_value != "NOT_FOUND" and len(extracted_value) > 0:
+                                data_collected[field_name] = extracted_value
+                                session["data_collected"] = data_collected
+                                logger.info(f"Extracted {field_name}: {extracted_value}")
+
+            return ai_response
+
+        except Exception as e:
+            logger.error(f"Local LLM error: {e}. Falling back to placeholder responses.")
             # Fall through to placeholder logic below
 
+    # FALLBACK: Placeholder responses if no LLM is enabled
     # TODO: Integrate with LLM (OpenAI, Claude, etc.)
     # Pass full context to LLM:
     # - agent_prompt: System prompt
