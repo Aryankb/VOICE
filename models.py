@@ -2,7 +2,7 @@
 Pydantic data models for the Twilio Voice AI Assistant
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from decimal import Decimal
@@ -277,3 +277,28 @@ class SessionData(BaseModel):
     def mark_synced(self):
         """Mark session as synced"""
         self.last_sync_count = self.message_count
+
+
+class VoiceAgentRequest(BaseModel):
+    """Request model for creating/updating voice agents (voice.py API)"""
+    goal: str = Field(..., description="Agent goal/prompt (used as name and system prompt)")
+    few_shot_examples: Optional[List[Dict[str, str]]] = Field(
+        None,
+        description="Few-shot examples for the agent"
+    )
+    mcp_servers: Optional[List[str]] = Field(
+        None,
+        description="List of MCP server names/URLs"
+    )
+    knowledge_files: Optional[List[str]] = Field(
+        None,
+        description="List of S3 paths or file URLs for knowledge base"
+    )
+    data_to_collect: Optional[Dict[str, Union[str, Dict[str, Any]]]] = Field(
+        None,
+        description="Data fields to collect from caller"
+    )
+    phone_numbers: Optional[List[str]] = Field(
+        None,
+        description="List of phone numbers to link to this agent"
+    )

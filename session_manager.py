@@ -79,16 +79,18 @@ async def create_session(
         raise
 
 
-async def get_session(
+def get_session(
     call_sid: str,
-    active_sessions: Dict[str, dict]
+    active_sessions: Dict[str, dict],
+    agent_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Get session from memory with recovery fallback
+    Get session from memory with recovery fallback (SYNC)
 
     Args:
         call_sid: Twilio call SID
         active_sessions: Reference to active_sessions dict
+        agent_id: Optional agent ID (needed for database recovery)
 
     Returns:
         Session dict
@@ -103,7 +105,7 @@ async def get_session(
     logger.warning(f"Session {call_sid} not in memory, attempting recovery")
 
     try:
-        call_record = await get_call_record(call_sid)
+        call_record = get_call_record(call_sid, agent_id=agent_id)  # SYNC call
 
         # Reconstruct minimal session (won't have agent_data or past_conversations)
         recovered_session = {
@@ -168,13 +170,13 @@ async def update_session(
             return False
 
 
-async def sync_session_to_db(
+def sync_session_to_db(
     call_sid: str,
     active_sessions: Dict[str, dict],
     force: bool = False
 ) -> bool:
     """
-    Sync session to database if sync threshold is met
+    Sync session to database if sync threshold is met (SYNC)
 
     Args:
         call_sid: Twilio call SID
@@ -208,11 +210,12 @@ async def sync_session_to_db(
             for msg in session.get("conversation_history", [])
         ]
 
-        # Sync to database
-        success = await sync_conversation_to_db(
+        # Sync to database (SYNC call with agent_id for SIGMOYD schema)
+        success = sync_conversation_to_db(
             call_sid=call_sid,
             conversation_history=conversation_history,
-            data_collected=session.get("data_collected")
+            data_collected=session.get("data_collected"),
+            agent_id=session.get("agent_id")
         )
 
         if success:

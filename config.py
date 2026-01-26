@@ -22,10 +22,11 @@ class Settings(BaseSettings):
     aws_access_key_id: Optional[str] = None  # Optional - uses boto3 default credential chain
     aws_secret_access_key: Optional[str] = None  # Optional - uses boto3 default credential chain
 
-    # DynamoDB Configuration
-    dynamodb_table_agents: str = "VoiceAssistant_Agents"
-    dynamodb_table_calls: str = "VoiceAssistant_Calls"
-    dynamodb_table_phone_numbers: str = "VoiceAssistant_PhoneNumbers"
+    # DynamoDB Configuration (matching voice.py schema)
+    dynamodb_table_agents: str = "Agents"
+    dynamodb_table_calls: str = "Calls"
+    dynamodb_table_phone_numbers: str = "PhoneNumbers"
+    dynamodb_table_agent_number_mapping: str = "AgentNumberMapping"
 
     # S3 Configuration
     s3_bucket_recordings: str = "voice-assistant-recordings"

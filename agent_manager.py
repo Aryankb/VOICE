@@ -1,15 +1,15 @@
 """
-Agent manager for fetching and caching agent configurations
+Agent manager for fetching and caching agent configurations (SIGMOYD-BACKEND schema)
 """
 
-import asyncio
 import logging
 from typing import Optional, Dict
 from datetime import datetime, timedelta
-from database import db_client
-from models import AgentConfig
+from tools.dynamo import db_client
+from models import AgentConfig, DataCollectionField
 from config import settings
 from exceptions import AgentNotFoundException, InvalidAgentConfigException
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +56,9 @@ class AgentCache:
 _agent_cache = AgentCache(ttl_seconds=settings.agent_cache_ttl_seconds)
 
 
-async def get_agent(agent_id: str, use_cache: bool = True) -> AgentConfig:
+def get_agent(agent_id: str, use_cache: bool = True) -> AgentConfig:
     """
-    Fetch agent configuration from DynamoDB
+    Fetch agent configuration from DynamoDB (SIGMOYD-BACKEND schema - SYNC)
 
     Args:
         agent_id: Agent identifier
@@ -77,26 +77,102 @@ async def get_agent(agent_id: str, use_cache: bool = True) -> AgentConfig:
         if cached_agent:
             return cached_agent
 
-    # Fetch from database
+    # Fetch from database (SYNC operation)
     try:
-        item = await db_client.get_item(
-            table_name=settings.dynamodb_table_agents,
-            key={'agent_id': agent_id}
+        response = db_client.get_item(
+            TableName=settings.dynamodb_table_agents,
+            Key={'agent_id': {'S': agent_id}}
         )
 
+        item = response.get('Item')
         if not item:
             logger.warning(f"Agent not found: {agent_id}")
             raise AgentNotFoundException(f"Agent {agent_id} not found")
 
-        # Parse and validate
+        # Parse SIGMOYD schema (with type descriptors)
         try:
-            agent_config = AgentConfig.from_dynamodb(item)
+            # Extract values from DynamoDB format
+            agent_id_val = item.get('agent_id', {}).get('S', '')
+            name = item.get('name', {}).get('S', 'Unnamed Agent')
+            prompt = item.get('prompt', {}).get('S', 'You are a helpful assistant.')
+            user_id = item.get('user_id', {}).get('S', '')
+            created_at = item.get('created_at', {}).get('S', '')
+
+            # Parse JSON fields
+            few_shot = []
+            if 'few_shot_examples' in item:
+                few_shot_str = item['few_shot_examples'].get('S', '[]')
+                few_shot_raw = json.loads(few_shot_str)
+                # Parse DynamoDB format if present
+                for example in few_shot_raw:
+                    if isinstance(example, dict) and 'M' in example:
+                        # Extract from DynamoDB Map
+                        parsed_example = {}
+                        for key, val in example['M'].items():
+                            if 'S' in val:
+                                parsed_example[key] = val['S']
+                        few_shot.append(parsed_example)
+                    else:
+                        few_shot.append(example)
+
+            mcp_servers = []
+            if 'mcp_servers' in item:
+                mcp_list = item['mcp_servers'].get('L', [])
+                mcp_servers = [s.get('S', '') for s in mcp_list]
+
+            knowledge_files = []
+            if 'knowledge_files' in item:
+                kf_list = item['knowledge_files'].get('L', [])
+                knowledge_files = [f.get('S', '') for f in kf_list]
+
+            data_to_collect = {}
+            if 'data_to_collect' in item:
+                data_str = item['data_to_collect'].get('S', '{}')
+                data_raw = json.loads(data_str)
+                # Convert to DataCollectionField format
+                for key, value in data_raw.items():
+                    if isinstance(value, dict):
+                        # Handle nested DynamoDB format {'M': {...}}
+                        if 'M' in value:
+                            # Extract from DynamoDB Map type
+                            field_data = {}
+                            for field_key, field_val in value['M'].items():
+                                if 'S' in field_val:
+                                    field_data[field_key] = field_val['S']
+                                elif 'BOOL' in field_val:
+                                    field_data[field_key] = field_val['BOOL']
+                                elif 'NULL' in field_val:
+                                    field_data[field_key] = None
+                            data_to_collect[key] = DataCollectionField(**field_data)
+                        else:
+                            # Already plain dict
+                            data_to_collect[key] = DataCollectionField(**value)
+                    else:
+                        data_to_collect[key] = value
+
+            # Build AgentConfig
+            agent_config = AgentConfig(
+                agent_id=agent_id_val,
+                name=name,
+                prompt=prompt,
+                few_shot=few_shot,
+                voice=item.get('voice', {}).get('S', 'Polly.Joanna'),
+                language=item.get('language', {}).get('S', 'en-US'),
+                greeting=item.get('greeting', {}).get('S', 'Hello! How can I help you today?'),
+                data_to_fill=data_to_collect,
+                mcp_config={'servers': mcp_servers},
+                s3_file_paths=knowledge_files,
+                status=item.get('status', {}).get('S', 'active'),
+                created_at=created_at,
+                updated_at=item.get('updated_at', {}).get('S')
+            )
+
         except Exception as e:
             logger.error(f"Invalid agent config for {agent_id}: {e}")
             raise InvalidAgentConfigException(f"Invalid agent configuration: {e}")
 
         # Validate agent is active
-        if agent_config.status != "active":
+        if agent_config.status and agent_config.status != "active":
             logger.warning(f"Agent {agent_id} is not active (status: {agent_config.status})")
             raise AgentNotFoundException(f"Agent {agent_id} is not active")
 
@@ -115,7 +191,7 @@ async def get_agent(agent_id: str, use_cache: bool = True) -> AgentConfig:
         raise
 
 
-async def get_agent_with_cache(agent_id: str) -> AgentConfig:
+def get_agent_with_cache(agent_id: str) -> AgentConfig:
     """
     Convenience method to fetch agent with caching enabled
 
@@ -125,137 +201,7 @@ async def get_agent_with_cache(agent_id: str) -> AgentConfig:
     Returns:
         AgentConfig object
     """
-    return await get_agent(agent_id, use_cache=True)
-
-
-async def create_agent(agent_config: AgentConfig) -> bool:
-    """
-    Create a new agent in DynamoDB
-
-    Args:
-        agent_config: AgentConfig object
-
-    Returns:
-        True if successful
-    """
-    try:
-        # Set created_at if not provided
-        if not agent_config.created_at:
-            agent_config.created_at = datetime.now().isoformat()
-
-        item = agent_config.to_dynamodb()
-
-        success = await db_client.put_item(
-            table_name=settings.dynamodb_table_agents,
-            item=item,
-            condition_expression="attribute_not_exists(agent_id)"  # Prevent overwriting
-        )
-
-        if success:
-            logger.info(f"Created agent {agent_config.agent_id}: {agent_config.name}")
-            # Invalidate cache in case it exists
-            _agent_cache.invalidate(agent_config.agent_id)
-
-        return success
-
-    except Exception as e:
-        logger.error(f"Error creating agent {agent_config.agent_id}: {e}")
-        raise
-
-
-async def update_agent(agent_id: str, updates: Dict[str, any]) -> bool:
-    """
-    Update an existing agent in DynamoDB
-
-    Args:
-        agent_id: Agent identifier
-        updates: Dictionary of fields to update
-
-    Returns:
-        True if successful
-    """
-    try:
-        # Add updated_at timestamp
-        updates['updated_at'] = datetime.now().isoformat()
-
-        success = await db_client.update_item(
-            table_name=settings.dynamodb_table_agents,
-            key={'agent_id': agent_id},
-            updates=updates,
-            condition_expression="attribute_exists(agent_id)"  # Ensure agent exists
-        )
-
-        if success:
-            logger.info(f"Updated agent {agent_id}")
-            # Invalidate cache
-            _agent_cache.invalidate(agent_id)
-
-        return success
-
-    except Exception as e:
-        logger.error(f"Error updating agent {agent_id}: {e}")
-        raise
-
-
-async def deactivate_agent(agent_id: str) -> bool:
-    """
-    Deactivate an agent (soft delete)
-
-    Args:
-        agent_id: Agent identifier
-
-    Returns:
-        True if successful
-    """
-    return await update_agent(agent_id, {'status': 'inactive'})
-
-
-async def list_active_agents(limit: int = 100) -> list[AgentConfig]:
-    """
-    List all active agents
-
-    Args:
-        limit: Maximum number of agents to return
-
-    Returns:
-        List of AgentConfig objects
-    """
-    try:
-        items = await db_client.query(
-            table_name=settings.dynamodb_table_agents,
-            key_condition_expression="#status = :status",
-            expression_attribute_values={':status': 'active'},
-            expression_attribute_names={'#status': 'status'},  # Alias reserved keyword
-            index_name='StatusIndex',
-            limit=limit,
-            scan_forward=False  # Most recent first
-        )
-
-        agents = [AgentConfig.from_dynamodb(item) for item in items]
-        logger.info(f"Listed {len(agents)} active agents")
-        return agents
-
-    except Exception as e:
-        logger.error(f"Error listing agents: {e}")
-        raise
-
-
-def get_default_agent_config() -> AgentConfig:
-    """
-    Get default agent configuration as fallback
-
-    Returns:
-        Default AgentConfig object
-    """
-    return AgentConfig(
-        agent_id="default",
-        name="Default Agent",
-        prompt="You are a helpful AI assistant. Answer questions politely and concisely.",
-        voice="Polly.Joanna",
-        language="en-US",
-        greeting="Hello! I'm your AI assistant. How can I help you today?",
-        status="active"
-    )
+    return get_agent(agent_id, use_cache=True)
 
 
 def invalidate_agent_cache(agent_id: Optional[str] = None):

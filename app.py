@@ -274,21 +274,21 @@ async def outbound_call_twiml(request: Request):
             from agent_manager import get_agent
             from call_manager import fetch_past_conversations, create_call_record
 
-            # Fetch agent configuration
-            agent_data = await get_agent(agent_id)
+            # Fetch agent configuration (SYNC)
+            agent_data = get_agent(agent_id)
 
             # Get recipient phone from session or form data
             recipient_phone = form_data.get("To") or active_sessions.get(call_sid, {}).get("to")
 
-            # Fetch past conversations for this agent-recipient pair
-            past_conversations = await fetch_past_conversations(
+            # Fetch past conversations for this agent-recipient pair (SYNC)
+            past_conversations = fetch_past_conversations(
                 agent_id=agent_id,
                 recipient_phone=recipient_phone,
                 limit=5
             )
 
-            # Create initial call record in database
-            await create_call_record(
+            # Create initial call record in database (SYNC)
+            create_call_record(
                 call_sid=call_sid,
                 agent_id=agent_id,
                 recipient_phone=recipient_phone,
@@ -376,7 +376,7 @@ async def make_call(request: Request):
         if settings.enable_dynamodb:
             from agent_manager import get_agent
             try:
-                agent = await get_agent(agent_id)
+                agent = get_agent(agent_id)  # SYNC call
                 logger.info(f"Validated agent {agent_id}: {agent.name}")
             except Exception as e:
                 logger.error(f"Agent validation failed: {e}")
@@ -535,7 +535,7 @@ async def process_speech(request: Request):
         # Sync final state to DB
         if settings.enable_dynamodb:
             from session_manager import sync_session_to_db
-            await sync_session_to_db(call_sid, active_sessions, force=True)
+            sync_session_to_db(call_sid, active_sessions, force=True)  # SYNC call
 
         return Response(content=str(response), media_type="application/xml")
 
@@ -575,7 +575,7 @@ async def process_speech(request: Request):
 
             if session["message_count"] % settings.session_sync_frequency == 0:
                 logger.info(f"Periodic sync triggered for {call_sid} at {session['message_count']} messages")
-                await sync_session_to_db(call_sid, active_sessions)
+                sync_session_to_db(call_sid, active_sessions)  # SYNC call
 
         # CHECK DATA COLLECTION COMPLETION
         # Don't auto-hangup - let conversation flow naturally
@@ -680,7 +680,7 @@ async def call_status(request: Request):
                         for msg in session.get("conversation_history", [])
                     ]
 
-                    await finalize_call(
+                    finalize_call(  # SYNC call
                         call_sid=call_sid,
                         status=call_status,
                         ended_at=datetime.now().isoformat(),
@@ -691,7 +691,8 @@ async def call_status(request: Request):
                         call_recording_sid=recording_sid,
                         s3_recording_url=s3_url,
                         data_collected=session.get("data_collected", {}),
-                        answered_by=answered_by
+                        answered_by=answered_by,
+                        agent_id=session.get("agent_id")  # Pass agent_id for SIGMOYD schema
                     )
 
                     logger.info(
@@ -1189,6 +1190,15 @@ async def interrupt_call(call_sid: str):
     except Exception as e:
         logger.error(f"Error interrupting call: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Mount voice.py REST API endpoints
+try:
+    from voice import router as voice_router
+    app.include_router(voice_router, prefix="/api/voice", tags=["Voice Management"])
+    logger.info("Voice management API mounted at /api/voice")
+except Exception as e:
+    logger.warning(f"Could not mount voice management API: {e}")
 
 
 if __name__ == "__main__":

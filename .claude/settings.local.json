@@ -4,7 +4,10 @@
       "WebSearch",
       "Bash(ls:*)",
       "Bash(powershell -Command \"[System.Environment]::SetEnvironmentVariable\\(''OLLAMA_HOST'', $null, ''Machine''\\)\")",
-      "Bash(uv run python:*)"
+      "Bash(uv run python:*)",
+      "Bash(grep:*)",
+      "Bash(cd:*)",
+      "Bash(python:*)"
     ]
   }
 }

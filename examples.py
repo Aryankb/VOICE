@@ -7,16 +7,17 @@ import json
 
 # Configuration
 BASE_URL = "http://localhost:8000"
-TO_NUMBER = "+917000978867"  # Replace with actual number
+TO_NUMBER = "+917600566015"  # Your number
 
 
 def make_outbound_call():
     """Example: Make an outbound call"""
     print("Making outbound call...")
-    
+
     response = requests.post(
         f"{BASE_URL}/make-call",
         json={
+            "agent_id": "my-agent-f5d024e8",  # Your personal agent
             "to_number": TO_NUMBER,
         }
     )
