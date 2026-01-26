@@ -188,7 +188,28 @@ async def main():
     # Update customer support agent
     try:
         customer_agent = await update_customer_support_agent()
-        await update_agent(customer_agent)
+        # Convert AgentConfig to dict for update
+        # Convert DataCollectionField objects to dicts
+        data_to_fill_dict = {}
+        for field_name, field_config in customer_agent.data_to_fill.items():
+            data_to_fill_dict[field_name] = {
+                "required": field_config.required,
+                "prompt": field_config.prompt,
+                "example": field_config.example,
+                "validation_pattern": field_config.validation_pattern
+            }
+
+        updates = {
+            "name": customer_agent.name,
+            "prompt": customer_agent.prompt,
+            "few_shot": customer_agent.few_shot,
+            "voice": customer_agent.voice,
+            "language": customer_agent.language,
+            "greeting": customer_agent.greeting,
+            "data_to_fill": data_to_fill_dict,
+            "status": customer_agent.status
+        }
+        await update_agent(customer_agent.agent_id, updates)
         print("✓ Updated: customer-support-001 (Tech Support Specialist)")
         print("  - New prompt focuses on troubleshooting BEFORE data collection")
         print("  - 5 few-shot examples showing proper conversation flow")
@@ -201,7 +222,28 @@ async def main():
     # Update sales agent
     try:
         sales_agent = await update_sales_agent()
-        await update_agent(sales_agent)
+        # Convert AgentConfig to dict for update
+        # Convert DataCollectionField objects to dicts
+        data_to_fill_dict = {}
+        for field_name, field_config in sales_agent.data_to_fill.items():
+            data_to_fill_dict[field_name] = {
+                "required": field_config.required,
+                "prompt": field_config.prompt,
+                "example": field_config.example,
+                "validation_pattern": field_config.validation_pattern
+            }
+
+        updates = {
+            "name": sales_agent.name,
+            "prompt": sales_agent.prompt,
+            "few_shot": sales_agent.few_shot,
+            "voice": sales_agent.voice,
+            "language": sales_agent.language,
+            "greeting": sales_agent.greeting,
+            "data_to_fill": data_to_fill_dict,
+            "status": sales_agent.status
+        }
+        await update_agent(sales_agent.agent_id, updates)
         print("✓ Updated: sales-001 (Solutions Consultant)")
         print("  - New prompt focuses on needs discovery")
         print("  - Consultative, not pushy")

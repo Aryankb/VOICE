@@ -3,7 +3,8 @@
     "allow": [
       "WebSearch",
       "Bash(ls:*)",
-      "Bash(powershell -Command \"[System.Environment]::SetEnvironmentVariable\\(''OLLAMA_HOST'', $null, ''Machine''\\)\")"
+      "Bash(powershell -Command \"[System.Environment]::SetEnvironmentVariable\\(''OLLAMA_HOST'', $null, ''Machine''\\)\")",
+      "Bash(uv run python:*)"
     ]
   }
 }

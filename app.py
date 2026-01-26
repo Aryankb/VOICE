@@ -502,6 +502,27 @@ async def process_speech(request: Request):
     # Reset no_input_count on successful input
     session["no_input_count"] = 0
 
+    # CHECK CONFIDENCE LEVEL
+    CONFIDENCE_THRESHOLD = 0.6
+    if float(confidence) < CONFIDENCE_THRESHOLD:
+        logger.warning(f"Low confidence ({confidence}) for: '{speech_result}'")
+        session["low_confidence_count"] = session.get("low_confidence_count", 0) + 1
+
+        # If consistently low confidence, ask user to speak clearer
+        if session["low_confidence_count"] >= 2:
+            response.say(
+                "I'm having a bit of trouble understanding you clearly. "
+                "Could you please speak a bit louder or find a quieter location? "
+                "What did you say?",
+                voice=voice
+            )
+            session["low_confidence_count"] = 0  # Reset after asking
+            response.redirect(f"{settings.public_url}/voice/process-speech")
+            return Response(content=str(response), media_type="application/xml")
+    else:
+        # Reset low confidence count on good input
+        session["low_confidence_count"] = 0
+
     # DETECT GOODBYE INTENT
     from session_manager import detect_goodbye_intent, is_data_collection_complete
 
